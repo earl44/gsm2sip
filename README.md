@@ -12,6 +12,31 @@ Bridges Android phone to any SIP server as GSM Gateway
 |--------|-----------------|----------|
 | <img src="screen1.png" width="300"> | <img src="screen2.png" width="300"> | <img src="screen3.png" width="300"> |
 
+## What This Fork Adds
+
+This fork adds a tested, fully digital audio path for the **Samsung Galaxy S
+Duos 2 GT-S7580/GT-S7582** (Broadcom Hawaii) running LineageOS 14.1 / Android
+7.1. The original project's other device profiles remain available.
+
+- A full-duplex Broadcom DSP VOIF bridge: GSM downlink is captured directly
+  from the modem DSP and decoded SIP audio replaces the handset microphone in
+  the GSM uplink. Neither direction depends on acoustic speaker/microphone
+  coupling.
+- A device-specific [`voif_tap`](device/kylepro/voif-tap/) kernel module,
+  source, tested binary and Android init configuration. The binary is only for
+  the exact kernel vermagic documented in its README; rebuild it for any other
+  kernel.
+- Android 7.1 support (`minSdk 25`) and a Broadcom Hawaii device profile.
+- More complete SIP diagnostics and transaction handling for UDP transport,
+  REGISTER authentication, Contact URIs, OPTIONS replies and INVITE responses.
+- Safer GSM call orchestration: SIP failure is logged without unnecessarily
+  disconnecting the incoming GSM call.
+- A configurable inbound SIP target, plus regression tests for SIP digest
+  authentication, caller identity and OPTIONS responses.
+
+The GT-S7580 path was verified on live bidirectional calls with FreePBX 17 and
+Asterisk 22 using G.722. The tested application version is **1.4.27**.
+
 ## How It Works
 
 A dedicated rooted Android phone with a local SIM card acts as a SIP-to-GSM gateway:
@@ -23,7 +48,7 @@ A dedicated rooted Android phone with a local SIM card acts as a SIP-to-GSM gate
 The call audio never goes through the phone's speaker or microphone.  On every
 supported phone the agent is put into the call, and the caller read out of it,
 digitally, inside the modem or the audio DSP, while the phone itself stays
-silent.  Four chip families do it, each in its own way:
+silent. Five chip families do it, each in its own way:
 
 | Chip family | Verified on | Agent → caller | Caller → agent |
 |---|---|---|---|
@@ -31,6 +56,7 @@ silent.  Four chip families do it, each in its own way:
 | Samsung Exynos | Galaxy S10e (Exynos 9820) | played into the ABOX DSP in place of the mic | tapped off the ABOX downlink |
 | MediaTek | Ulefone Metal (MT6753) | the modem's background-sound player | `VOICE_DOWNLINK` |
 | Google Tensor | Pixel 7 (gs201) | `incall playback` → Telephony Tx | the AoC telephony-rx PCM, over root |
+| Broadcom Hawaii | Galaxy S Duos 2 GT-S7580/GT-S7582 | writable DSP VOIF uplink | DSP VOIF downlink tap |
 
 The S10e was listed here as impossible for a long time: its audio HAL has no
 telephony path at all.  It now works by going past the HAL, straight to the
@@ -63,6 +89,7 @@ remote actually offered rather than failing a call over a preference.
 | Ulefone Metal (`metal`) | MediaTek MT6753 (MT6735 family) | digital, via the modem's background-sound player | digital, via `VOICE_DOWNLINK` | working on madOS 8.1 (Android 8.1); verified on live calls, see [MediaTek](#mediatek-mt6735mt6753) |
 | Google Pixel 7 (`panther`) | Google Tensor G2 (gs201), AoC audio DSP | digital, via `incall playback` → `Telephony Tx` | digital, via `tinycap` on the AoC telephony-rx PCM (root) | **working** on LineageOS 24 (Android 17), verified on live VoLTE calls |
 | Samsung Galaxy S10e (`beyond0lte`) | Exynos 9820, CS47L93 | digital, played into the ABOX in place of the mic | digital, tapped off the ABOX downlink | **working** on LineageOS 23.2, with `abox_pos.ko` |
+| Samsung Galaxy S Duos 2 (`kylepro`, GT-S7580/GT-S7582) | Broadcom BCM21664 Hawaii | digital, written into the DSP VOIF uplink | digital, read from the DSP VOIF downlink | **fully working** on LineageOS 14.1 / Android 7.1, with `voif_tap.ko` |
 
 **The Poco X3 NFC is the reference device and works fully**: G.722 wideband in
 both directions, entirely through the modem, with the handset's own microphone
