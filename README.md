@@ -37,6 +37,12 @@ Duos 2 GT-S7580/GT-S7582** (Broadcom Hawaii) running LineageOS 14.1 / Android
 The GT-S7580 path was verified on live bidirectional calls with FreePBX 17 and
 Asterisk 22 using G.722. The tested application version is **1.4.27**.
 
+> **Fun fact:** this fork was built by **OpenAI Codex**, with a human doing the
+> important part — repeatedly saying “call completed” and reporting which end
+> could hear whom. By the time both directions were finally perfect,
+> **132.6 million tokens** had gone into it. Apparently old Broadcom audio DSPs
+> do not surrender their secrets cheaply.
+
 ## How It Works
 
 A dedicated rooted Android phone with a local SIM card acts as a SIP-to-GSM gateway:
