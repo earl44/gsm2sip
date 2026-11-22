@@ -1,5 +1,6 @@
 package com.callagent.gateway
 
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import java.io.BufferedReader
@@ -20,6 +21,22 @@ import java.util.concurrent.LinkedBlockingQueue
 object RootShell {
     private const val TAG = "RootShell"
     private const val MARKER = "___ROOT_SHELL_DONE___"
+
+    private fun waitForCompat(proc: Process, timeoutSeconds: Long): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            return proc.waitFor(timeoutSeconds, TimeUnit.SECONDS)
+        }
+        val deadline = SystemClock.elapsedRealtime() + timeoutSeconds * 1000
+        while (SystemClock.elapsedRealtime() < deadline) {
+            try {
+                proc.exitValue()
+                return true
+            } catch (_: IllegalThreadStateException) {
+                SystemClock.sleep(50)
+            }
+        }
+        return false
+    }
 
     private var process: Process? = null
     private var writer: OutputStreamWriter? = null
@@ -278,7 +295,7 @@ object RootShell {
     private fun execFallback(cmd: String): Int {
         return try {
             val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
-            if (proc.waitFor(5, TimeUnit.SECONDS)) proc.exitValue() else -1
+            if (waitForCompat(proc, 5)) proc.exitValue() else -1
         } catch (e: Exception) {
             Log.w(TAG, "Fallback exec failed: ${e.message}")
             -1
@@ -289,7 +306,7 @@ object RootShell {
         return try {
             val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
             val out = proc.inputStream.bufferedReader().readText().trim()
-            proc.waitFor(5, TimeUnit.SECONDS)
+            waitForCompat(proc, 5)
             out
         } catch (e: Exception) {
             Log.w(TAG, "Fallback exec failed: ${e.message}")

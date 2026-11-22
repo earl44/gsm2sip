@@ -1,0 +1,17 @@
+# Samsung GT-S7580 / Broadcom Hawaii full-duplex digital GSM audio for gsm2sip.
+# voif_tap starts the dormant vendor DSP VOIF interface: the app reads the GSM
+# downlink and writes SIP audio directly into the GSM uplink. No microphone or
+# ALSA capture route is opened.
+
+# The Broadcom audio driver is not consistently ready during post-fs-data.
+# Load VOIF once Android has completed boot; the app only opens the device when
+# an active bridged call needs audio, so this remains ready well before use.
+on property:sys.boot_completed=1
+    chmod 0644 /data/local/tmp/voif_tap.ko
+    exec -- /system/bin/insmod /data/local/tmp/voif_tap.ko
+    chmod 0666 /dev/voif_tap
+
+    # Keep the known-good private handset call route.  C1 is intentionally not
+    # changed: capture comes from VOIF, not a CAPH PCM source selector.
+    chmod 0755 /data/local/tmp/tinymix
+    exec -- /data/local/tmp/tinymix C2-SEL 1

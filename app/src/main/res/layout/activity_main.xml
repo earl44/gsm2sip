@@ -546,7 +546,19 @@
                         <TextView
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="Sent as the SIP destination so the server can map the call to an assistant. Without it the gateway addresses its own extension and the call loops back."
+                            android:text="The SIM phone number used for caller and SIM identification."
+                            android:textSize="12sp"
+                            android:textColor="@color/text_hint"
+                            android:paddingTop="6dp" />
+
+                        <TextView style="@style/CfgLabel" android:text="Inbound SIP Target" />
+                        <EditText android:id="@+id/etCfgInboundTarget" style="@style/CfgField"
+                            android:hint="extension, e.g. 600" android:inputType="text" />
+
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="Incoming GSM calls are sent to this SIP extension. If empty, the SIM phone number is used for compatibility."
                             android:textSize="12sp"
                             android:textColor="@color/text_hint"
                             android:paddingTop="6dp" />

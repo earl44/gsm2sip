@@ -173,6 +173,14 @@ data class DeviceProfile(
     /** Whether VOICE_DOWNLINK returns real audio on this device. */
     val voiceDownlinkWorks: Boolean,
 
+    /** Never open VOICE_CALL/VOICE_DOWNLINK through AudioRecord.
+     *
+     *  Some legacy vendor HALs accept these privileged sources and then crash
+     *  audioserver as soon as recording starts.  In that case an acoustic
+     *  speaker-to-microphone bridge is less elegant, but it keeps both the GSM
+     *  call and the SIP media service alive. */
+    val avoidTelephonyCaptureSources: Boolean = false,
+
     /** Voice call stream volume as percentage of max (0=minimum non-zero).
      *  Controls the caller's voice volume on the speaker.
      *  MSM8930: 0 (muted via tinymix muteVoiceRx).
@@ -197,6 +205,16 @@ data class DeviceProfile(
      *  hear it — and the gate then does nothing but discard the caller's voice
      *  every time the agent talks. */
     val playbackLeaksIntoCapture: Boolean = true,
+
+    /** Allow capture energy above the learned echo level through while SIP
+     *  playback is active.  Disable on feedback-prone legacy paths where the
+     *  returned playback is amplified unpredictably and looks like barge-in. */
+    val allowEchoDoubleTalk: Boolean = true,
+
+    /** Keep capture muted for this long after SIP playback activity ends.
+     *  Needed where the cellular/VoIP path returns several delayed copies of
+     *  playback after the short DSP echo tail has already decayed. */
+    val echoHoldMs: Long = 0,
 
     /** Prefer UNPROCESSED/CAMCORDER over the voice-tuned capture sources.
      *
@@ -230,6 +248,10 @@ data class DeviceProfile(
      *  the downlink is muted there the agent hears nothing but background. */
     val captureFromTelephonyRx: Boolean = false,
 
+    /** Read the cellular downlink from the Broadcom VOIF kernel tap.  This is
+     *  digital modem PCM, not an Android microphone or an ALSA capture path. */
+    val voifCapture: Boolean = false,
+
     /** Read the caller straight from an ALSA PCM over root (tinycap) instead
      *  of through AudioRecord — see [RootCapture].  null = off.
      *
@@ -237,6 +259,11 @@ data class DeviceProfile(
      *  the DSP's own capture stream is not.  AudioRecord sources remain the
      *  fallback if tinycap cannot be started or exits. */
     val rootCapture: RootCapture? = null,
+
+    /** Do not fall back to an acoustic AudioRecord source when raw capture
+     *  fails.  A silent digital leg is preferable to leaking the room through
+     *  the handset microphone on unattended gateways. */
+    val rootCaptureRequired: Boolean = false,
 
     /** Ask for the playback track to be routed to the telephony TX device.
      *
@@ -503,6 +530,15 @@ data class DeviceProfile(
                 device == "metal" && Build.MANUFACTURER.equals("Ulefone", ignoreCase = true)
 
             return when {
+                // Samsung Galaxy S Duos 2 (GT-S7580/GT-S7582).  Its legacy
+                // Broadcom HAL exposes dedicated 16 kHz VoIP input/output
+                // streams and AUDIO_DEVICE_IN_VOICE_CALL.  Unlike Qualcomm,
+                // there is no tinymix incall_music route; selecting the phone
+                // strategy is what makes AudioPolicy choose the HAL's VoIP
+                // stream while a cellular call is active.
+                platform == "hawaii" || hw.contains("hawaii") ->
+                    broadcomHawaii()
+
                 // Ulefone Metal and other MT6735/MT6753 phones sharing its audio HAL.
                 mt6735Family -> mt6753()
 
@@ -557,6 +593,56 @@ data class DeviceProfile(
         }
 
         // ── Known device profiles ──
+
+        /** Broadcom Hawaii (Samsung GT-S7580/GT-S7582, Android 7.1). */
+        fun broadcomHawaii() = DeviceProfile(
+            name = "Broadcom Hawaii (GT-S7580/GT-S7582)",
+            mixerSetupCmd = "",
+            mixerRestoreCmd = "",
+            mixerIncallMusicCmd = "",
+            mixerVerifyCmd = "echo -n 'C2-SEL='; tinymix get 'C2-SEL' 2>&1; " +
+                "echo -n 'C3-SEL='; tinymix get 'C3-SEL' 2>&1",
+            musicVolPercent = 100,
+            // CAPH PCM1 is clean but quiet on narrow-band GSM.  The measured
+            // peak (~5400 at unity) leaves enough headroom for x4 gain.
+            captureGain = 4,
+            playbackGain = 1,
+            // Direct modem PCM has real digital silence.  A threshold of 100
+            // discarded most quiet speech frames and made the SIP side sound
+            // chopped, so forward the complete stream.
+            noiseGateThreshold = 0,
+            // Kept for diagnostics; the DSP downlink is independent of the
+            // SIP-to-GSM uplink and therefore does not use the echo gate.
+            echoGateThreshold = 80,
+            doubleTalkRatio = 4.0f,
+            // The Broadcom 21664 HAL crashes audioserver when a hidden
+            // VOICE_DOWNLINK AudioRecord starts.  Caller audio now comes from
+            // CAPH PCM1 directly, so the handset must remain on its private
+            // earpiece route rather than being forced to speakerphone.
+            requireSpeakerMode = false,
+            incallMusicParam = "",
+            voiceDownlinkWorks = false,
+            avoidTelephonyCaptureSources = true,
+            voiceCallVolPercent = 0,
+            playbackUsage = AudioAttributes.USAGE_VOICE_COMMUNICATION,
+            playbackLeaksIntoCapture = false,
+            allowEchoDoubleTalk = false,
+            // The decaying playback reference already covers about 300 ms of
+            // DSP tail.  Another 400 ms catches the delayed return without
+            // letting sparse comfort-noise peaks mute the GSM side forever.
+            echoHoldMs = 400,
+            preferVoiceRecognition = true,
+            silenceFallback = false,
+            // The ROM compiled VoIF_init() as a stub, but kept the complete
+            // Broadcom DSP VOIF driver.  voif_tap.ko starts that interface and
+            // publishes the untouched 8 kHz cellular downlink.  Do not fall
+            // back to CAPH PCM0: it is the microphone or an invalid route.
+            voifCapture = true,
+            rootCaptureRequired = true,
+            playbackFadeIn = false,
+            routeChangeDelayMs = 250,
+            appopsPropagationMs = 100,
+        )
 
         /** Samsung Galaxy S4 Mini (MSM8930 / WCD9304 codec) */
         fun msm8930() = DeviceProfile(
@@ -1412,6 +1498,8 @@ data class RootCapture(
     val card: Int,
     val device: Int,
     val rate: Int,
+    val periodSize: Int = 0,
+    val periodCount: Int = 0,
     val setupCmd: String = "",
     val restoreCmd: String = "",
 )

@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.media.AudioManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -54,6 +55,8 @@ object GsmCallManager {
      * cause is what decides the SIP status the server is told.
      */
     @Volatile var lastDisconnectCause: DisconnectCause? = null
+        private set
+    @Volatile var lastLocalDisconnectAction: String? = null
         private set
     @Volatile var inCallService: InCallService? = null; private set
 
@@ -112,6 +115,7 @@ object GsmCallManager {
         activeCall = call
         activeCallState = call.state
         lastDisconnectCause = null
+        lastLocalDisconnectAction = null
         // Release the previous call's object; the dedupe only needs to span
         // one call's own disconnect.
         endedCall = null
@@ -194,7 +198,7 @@ object GsmCallManager {
     }
 
     fun onCallRemoved(call: Call) {
-        Log.i(TAG, "GSM call removed")
+        Log.i(TAG, "GSM call removed (${disconnectSummary(call)})")
         if (activeCall == call) {
             activeCall = null
             activeCallState = Call.STATE_DISCONNECTED
@@ -227,7 +231,7 @@ object GsmCallManager {
                     Log.w(TAG, "Disconnect cause unavailable: ${e.message}")
                     null
                 }
-                Log.i(TAG, "GSM call disconnected (cause=${lastDisconnectCause?.code})")
+                Log.i(TAG, "GSM call disconnected (${disconnectSummary(call, lastDisconnectCause)})")
                 notifyCallEnded(call)
                 if (activeCall == call) {
                     activeCall = null
@@ -285,17 +289,26 @@ object GsmCallManager {
     /** Reject a ringing GSM call */
     fun rejectCall(call: Call? = activeCall) {
         call?.let {
-            Log.i(TAG, "Rejecting GSM call")
+            lastLocalDisconnectAction = "gateway rejected incoming call"
+            Log.i(TAG, "Rejecting GSM call (localAction=$lastLocalDisconnectAction)")
             it.reject(false, "")
         }
     }
 
     /** Hang up active GSM call */
-    fun hangupCall(call: Call? = activeCall) {
+    fun hangupCall(call: Call? = activeCall, reason: String = "gateway hangup") {
         call?.let {
-            Log.i(TAG, "Hanging up GSM call")
+            lastLocalDisconnectAction = reason
+            Log.i(TAG, "Hanging up GSM call (localAction=$reason, state=${it.state})")
             it.disconnect()
         }
+    }
+
+    private fun disconnectSummary(call: Call, causeOverride: DisconnectCause? = null): String {
+        val cause = causeOverride ?: try { call.details?.disconnectCause } catch (_: Exception) { null }
+        return "code=${cause?.code}, label=${cause?.label}, description=${cause?.description}, " +
+            "reason=${cause?.reason}, tone=${cause?.tone}, " +
+            "localAction=${lastLocalDisconnectAction ?: "none"}"
     }
 
     /** Place outgoing GSM call via the SIM */
@@ -337,29 +350,9 @@ object GsmCallManager {
     @SuppressLint("MissingPermission")
     fun sendMmi(context: Context, dialString: String, onResult: (String) -> Unit) {
         val code = dialString.trim()
-        if (code.endsWith("#")) {
+        if (code.endsWith("#") && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try {
-                val telephony =
-                    context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-                telephony.sendUssdRequest(
-                    code,
-                    object : TelephonyManager.UssdResponseCallback() {
-                        override fun onReceiveUssdResponse(
-                            tm: TelephonyManager, request: String, response: CharSequence
-                        ) {
-                            Log.i(TAG, "USSD $request → $response")
-                            onResult(response.toString())
-                        }
-
-                        override fun onReceiveUssdResponseFailed(
-                            tm: TelephonyManager, request: String, failureCode: Int
-                        ) {
-                            Log.w(TAG, "USSD $request failed (code $failureCode)")
-                            onResult("USSD $request failed (code $failureCode)")
-                        }
-                    },
-                    Handler(Looper.getMainLooper())
-                )
+                UssdCompat.send(context, code, onResult)
                 return
             } catch (e: Exception) {
                 Log.w(TAG, "sendUssdRequest failed (${e.message}) — falling back to Telecom")

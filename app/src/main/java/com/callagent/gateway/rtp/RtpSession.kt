@@ -60,6 +60,9 @@ class RtpSession(
     private var socket: DatagramSocket? = null
     /** Where the caller is read from: an AudioRecord, or a PCM over root. */
     @Volatile private var capture: CaptureSource? = null
+    /** Broadcom DSP bridge used for cellular downlink capture and direct
+     * SIP-to-modem uplink injection. */
+    @Volatile private var voifDuplex: VoifCapture? = null
     private var audioTrack: AudioTrack? = null
     /** 1 or 2, per [DeviceProfile.playbackStereo]. */
     private var playbackChannels = 1
@@ -243,8 +246,22 @@ class RtpSession(
             return
         }
 
-        if (!initAudio()) {
+        try {
+            if (!initAudio()) {
+                running.set(false)
+                socket?.close()
+                socket = null
+                return
+            }
+        } catch (e: Exception) {
+            // AudioFlinger/audioserver may restart on this legacy device.  In
+            // that window getMinBufferSize() and AudioTrack.Builder can fail;
+            // never let that kill GatewayService (and the active GSM call).
+            Log.e(TAG, "Audio init failed: ${e.javaClass.simpleName}: ${e.message}", e)
             running.set(false)
+            socket?.close()
+            socket = null
+            listener?.onRtpError("Audio init failed: ${e.message ?: e.javaClass.simpleName}")
             return
         }
 
@@ -333,6 +350,23 @@ class RtpSession(
             else -> 16000  // G.722
         }
 
+        // Open VOIF before the worker threads start. Playback can receive its
+        // first packet before the capture worker is scheduled; opening here
+        // also activates replacement of the physical handset microphone.
+        if (profile.voifCapture) {
+            val cap = VoifCapture()
+            if (!cap.start()) {
+                Log.e(TAG, "Full-duplex VOIF device unavailable")
+                listener?.onRtpError("VOIF device unavailable")
+                return false
+            }
+            capture = cap
+            voifDuplex = cap
+            captureRate = 8000
+            audioSourceName = cap.name
+            currentSourceId = -1
+        }
+
         profile.rootPcm?.let { route ->
             if (startRootPcm(route)) return true
             listener?.onRtpStats("Root PCM path failed — falling back to the audio HAL")
@@ -406,6 +440,23 @@ class RtpSession(
             configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
         }
 
+        if (profile.avoidTelephonyCaptureSources) {
+            configs.removeAll {
+                it.source == MediaRecorder.AudioSource.VOICE_CALL ||
+                    it.source == MediaRecorder.AudioSource.VOICE_DOWNLINK
+            }
+            if (profile.voifCapture) {
+                Log.i(TAG, "Profile uses DSP VOIF downlink; telephony AudioRecord sources disabled")
+                listener?.onRtpStats("Legacy HAL: DSP VOIF downlink configured")
+            } else if (profile.rootCapture != null) {
+                Log.i(TAG, "Profile uses direct ALSA capture; telephony AudioRecord sources disabled")
+                listener?.onRtpStats("Legacy HAL: direct ALSA capture configured")
+            } else {
+                Log.w(TAG, "Profile forbids VOICE_CALL/VOICE_DOWNLINK; using safe acoustic capture")
+                listener?.onRtpStats("Legacy HAL: safe microphone capture (telephony sources disabled)")
+            }
+        }
+
         // Same preference as the fallback list, applied here too -- this is
         // the list that picks the source a call actually opens on, and
         // reordering only the fallback list left every call still starting on
@@ -425,7 +476,7 @@ class RtpSession(
         // torn down as soon as tinycap is up.  Verified on the Pixel 7 — the
         // telephony-rx PCM carries the caller with no AudioRecord open.  The
         // search in captureInitAndLoop opens one if root capture fails.
-        if (profile.rootCapture != null) configs.clear()
+        if (profile.voifCapture || profile.rootCapture != null) configs.clear()
 
         // No appops assertion and no propagation sleep here.  CallOrchestrator
         // .startRtp() runs the very same grant sequence synchronously
@@ -503,10 +554,24 @@ class RtpSession(
         // the speaker, not into the voice uplink.  Asking for a larger buffer
         // pushes the HAL to deep-buffer-playback on MultiMedia1, which is the
         // front-end the Incall_Music mixer injects from.
-        val playBufSize = if (profile.playbackBufferMs > 0) {
-            maxOf(minPlayBuf, playbackRate * 2 * playbackChannels * profile.playbackBufferMs / 1000)
+        val requestedPlayBuf = if (profile.playbackBufferMs > 0) {
+            playbackRate * 2 * playbackChannels * profile.playbackBufferMs / 1000
         } else {
-            minPlayBuf
+            0
+        }
+        // ERROR/ERROR_BAD_VALUE are negative. Passing either to Builder throws
+        // IllegalArgumentException and previously crashed the entire service.
+        // When AudioFlinger is recovering, omit the explicit size and let the
+        // framework choose one; a later call can obtain the true minimum.
+        val playBufSize = when {
+            minPlayBuf > 0 && requestedPlayBuf > 0 -> maxOf(minPlayBuf, requestedPlayBuf)
+            minPlayBuf > 0 -> minPlayBuf
+            requestedPlayBuf > 0 -> requestedPlayBuf
+            else -> 0
+        }
+        if (minPlayBuf <= 0) {
+            Log.w(TAG, "AudioTrack minimum buffer unavailable ($minPlayBuf) at ${playbackRate}Hz; " +
+                if (playBufSize > 0) "using profile request $playBufSize B" else "using framework default")
         }
 
         // Profile-controlled playback usage:
@@ -556,13 +621,13 @@ class RtpSession(
             )
             .setTransferMode(AudioTrack.MODE_STREAM)
             .apply {
-                if (profile.playbackLowLatency) {
+                if (profile.playbackLowLatency && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     // Deliberately no setBufferSizeInBytes here: asking for
                     // low latency and then handing the framework a large
                     // buffer is contradictory, and the request is silently
                     // ignored.  Let it size the buffer itself.
                     setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-                } else {
+                } else if (playBufSize > 0) {
                     setBufferSizeInBytes(playBufSize)
                 }
             }
@@ -673,6 +738,27 @@ class RtpSession(
 
         val defaultRemoteInet = InetAddress.getByName(remoteAddr)
 
+        if (profile.voifCapture) {
+            (capture as? VoifCapture)?.let {
+                if (captureLoop() || !running.get()) return
+            }
+            for (attempt in 1..ROOT_CAPTURE_ATTEMPTS) {
+                if (!running.get()) return
+                val cap = VoifCapture()
+                if (cap.start()) {
+                    capture = cap
+                    voifDuplex = cap
+                    captureRate = 8000
+                    audioSourceName = cap.name
+                    currentSourceId = -1
+                    if (captureLoop() || !running.get()) return
+                }
+                cap.release()
+                Log.w(TAG, "VOIF capture unavailable (attempt $attempt/$ROOT_CAPTURE_ATTEMPTS)")
+                sendSilencePackets(500, defaultRemoteInet)
+            }
+        }
+
         // Root PCM capture first where the profile asks for it — see
         // DeviceProfile.rootCapture.  tinycap can exit mid-call (the HAL
         // re-opens the in-call usecases on hold/resume or a RAT handover), and
@@ -688,6 +774,12 @@ class RtpSession(
                 sendSilencePackets(500, defaultRemoteInet)
             }
             Log.w(TAG, "Root PCM capture unavailable — trying the AudioRecord sources")
+        }
+
+        if ((profile.voifCapture || profile.rootCapture != null) && profile.rootCaptureRequired) {
+            Log.e(TAG, "Required digital capture unavailable — refusing microphone fallback")
+            while (running.get()) sendSilencePackets(5000, defaultRemoteInet)
+            return
         }
 
         // Fast path: the source was already opened in initAudio (warm boot)
@@ -804,7 +896,11 @@ class RtpSession(
         }
         val rate = if (wideband) 16000 else 8000
         val cap = try {
-            RootPcmCapture(cfg.card, cfg.device, cfg.rate, rate, setup, DeviceProfile.resolveCmd(cfg.restoreCmd))
+            RootPcmCapture(
+                cfg.card, cfg.device, cfg.rate, rate,
+                cfg.periodSize, cfg.periodCount,
+                setup, DeviceProfile.resolveCmd(cfg.restoreCmd)
+            )
         } catch (e: IllegalArgumentException) {
             Log.w(TAG, "Root PCM capture: ${e.message}")
             return false
@@ -828,6 +924,7 @@ class RtpSession(
     private fun releaseCaptureSource() {
         val src = capture ?: return
         capture = null
+        if (src === voifDuplex) voifDuplex = null
         src.close()
         Thread({ src.release() }, "capture-release").start()
     }
@@ -894,6 +991,12 @@ class RtpSession(
                 configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK@16k", 16000))
             }
             configs.add(SourceConfig(MediaRecorder.AudioSource.VOICE_DOWNLINK, "VOICE_DOWNLINK", 8000))
+        }
+        if (profile.avoidTelephonyCaptureSources) {
+            configs.removeAll {
+                it.source == MediaRecorder.AudioSource.VOICE_CALL ||
+                    it.source == MediaRecorder.AudioSource.VOICE_DOWNLINK
+            }
         }
         if (profile.preferVoiceRecognition) {
             // Ahead of everything, including VOICE_DOWNLINK: on these handsets
@@ -992,6 +1095,7 @@ class RtpSession(
         // Unblock the capture thread's read now — for tinycap that means
         // killing it — so the joins below do not wait on it.
         capture = null
+        voifDuplex = null
         cap?.close()
         audioTrack = null
         socket = null
@@ -1082,6 +1186,7 @@ class RtpSession(
     //   300ms (15 frames): ~3%  → effectively zero
     // This allows barge-in after ~200ms while suppressing echo tails.
     private var decayingPlaybackRms = 0
+    private var lastPlaybackActiveNs = 0L
 
     // Adaptive echo gain: ratio of capture RMS to playback RMS during
     // confirmed echo-only frames.  Updated via exponential moving average.
@@ -1314,18 +1419,23 @@ class RtpSession(
         // through brief inter-word gaps to suppress echo tails.
         if (currentPlaybackActive && playbackRms > 0) {
             decayingPlaybackRms = playbackRms
+            lastPlaybackActiveNs = System.nanoTime()
         } else if (decayingPlaybackRms > 0) {
             decayingPlaybackRms = (decayingPlaybackRms * 0.80).toInt()
         }
 
+        val echoHoldActive = profile.echoHoldMs > 0 && lastPlaybackActiveNs > 0L &&
+            System.nanoTime() - lastPlaybackActiveNs < profile.echoHoldMs * 1_000_000L
+
         val shouldForward: Boolean
         if (profile.playbackLeaksIntoCapture &&
-            decayingPlaybackRms > echoGateThreshold) {
+            (decayingPlaybackRms > echoGateThreshold || echoHoldActive)) {
             // Agent is speaking (or echo tail still decaying) —
             // check for double-talk (barge-in).
             val expectedEcho = (echoGainRatio * decayingPlaybackRms).toInt()
                 .coerceAtLeast(noiseGateThreshold)
-            if (rawCaptureRms > (expectedEcho * DOUBLE_TALK_RATIO).toInt()) {
+            if (profile.allowEchoDoubleTalk &&
+                rawCaptureRms > (expectedEcho * DOUBLE_TALK_RATIO).toInt()) {
                 // Double-talk: caller speaking over agent — forward.
                 // Some echo leaks through but caller is audible.
                 shouldForward = true
@@ -1623,6 +1733,7 @@ class RtpSession(
     /** One playback frame to wherever this session plays: the AudioTrack, or
      *  the root PCM pipe. */
     private fun writePlaybackOut(track: AudioTrack?, data: ByteArray) {
+        voifDuplex?.writeUplink(data, playbackRate)
         val root = pcmPlayback
         if (root != null) writeRootPlaybackFrame(root, data)
         else if (track != null) writePlaybackFrame(track, data)

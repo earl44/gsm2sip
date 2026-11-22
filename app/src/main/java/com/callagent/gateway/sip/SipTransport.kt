@@ -65,7 +65,7 @@ class UdpSipTransport(
 
     override val viaTransport = "UDP"
 
-    private var fd: java.io.FileDescriptor? = null
+    @Volatile private var fd: java.io.FileDescriptor? = null
     private val buf = ByteArray(4096)
 
     override val isOpen: Boolean get() = fd?.valid() == true
@@ -74,7 +74,12 @@ class UdpSipTransport(
         close()
         val f = Os.socket(OsConstants.AF_INET, OsConstants.SOCK_DGRAM, OsConstants.IPPROTO_UDP)
         try {
-            Os.setsockoptInt(f, OsConstants.SOL_SOCKET, OsConstants.SO_REUSEADDR, 1)
+            // setsockoptInt was only exposed in the public SDK in API 26.
+            // Reuse is an optimisation here; a freshly-created gateway socket
+            // still works on Android 7 without it.
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                Os.setsockoptInt(f, OsConstants.SOL_SOCKET, OsConstants.SO_REUSEADDR, 1)
+            }
             // setsockoptTimeval is API 29; below it the timeout is a poll()
             // in receive() instead, or opening a UDP transport crashed with
             // NoSuchMethodError on Android 9.
@@ -85,6 +90,7 @@ class UdpSipTransport(
             network?.bindSocket(f)
             Os.bind(f, InetAddress.getByName("0.0.0.0"), localPort)
             fd = f
+            Log.i(TAG, "UDP socket open: ${Os.getsockname(f)} fdValid=${f.valid()} networkBound=${network != null}")
         } catch (e: Exception) {
             try { Os.close(f) } catch (_: Exception) { }
             throw e
@@ -93,13 +99,15 @@ class UdpSipTransport(
 
     override fun send(data: String, host: String, port: Int) {
         val bytes = data.toByteArray(Charsets.UTF_8)
-        fd?.let { Os.sendto(it, bytes, 0, bytes.size, 0, InetAddress.getByName(host), port) }
+        val socket = fd ?: throw IllegalStateException("UDP socket is closed")
+        Os.sendto(socket, bytes, 0, bytes.size, 0, InetAddress.getByName(host), port)
     }
 
     /** Pre-resolved server address, so sending never blocks on DNS. */
     fun send(data: String, addr: InetAddress, port: Int) {
         val bytes = data.toByteArray(Charsets.UTF_8)
-        fd?.let { Os.sendto(it, bytes, 0, bytes.size, 0, addr, port) }
+        val socket = fd ?: throw IllegalStateException("UDP socket is closed")
+        Os.sendto(socket, bytes, 0, bytes.size, 0, addr, port)
     }
 
     override fun receive(): Pair<String, Pair<String, Int>>? {
@@ -115,7 +123,10 @@ class UdpSipTransport(
             val length = Os.recvfrom(f, buf, 0, buf.size, 0, source)
             val data = String(buf, 0, length, Charsets.UTF_8)
             data to (source.address.hostAddress.orEmpty() to source.port)
-        } catch (_: android.system.ErrnoException) {
+        } catch (e: android.system.ErrnoException) {
+            if (fd != null && e.errno != OsConstants.EAGAIN && e.errno != OsConstants.EINTR) {
+                Log.w(TAG, "UDP receive failed: errno=${e.errno} ${e.message}")
+            }
             null
         } catch (_: SocketException) {
             null
@@ -123,8 +134,17 @@ class UdpSipTransport(
     }
 
     override fun close() {
-        fd?.let { try { Os.close(it) } catch (_: Exception) { } }
+        fd?.let {
+            try {
+                Log.i(TAG, "Closing UDP socket: ${runCatching { Os.getsockname(it) }.getOrNull()}")
+                Os.close(it)
+            } catch (_: Exception) { }
+        }
         fd = null
+    }
+
+    companion object {
+        private const val TAG = "UdpSipTransport"
     }
 }
 

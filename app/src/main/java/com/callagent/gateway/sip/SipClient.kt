@@ -60,6 +60,7 @@ class SipClient(
     private val cseq = AtomicInteger(1)
     private var callIdBase = "${System.currentTimeMillis() / 1000}@$publicIp"
     private val running = AtomicBoolean(false)
+    @Volatile private var receiveThread: Thread? = null
     @Volatile var registered = false; private set
     @Volatile private var lastRegisterTime = 0L
     /** Tracks last time we got ANY response from server (REGISTER, OPTIONS, etc.) */
@@ -124,10 +125,10 @@ class SipClient(
         callIdBase = "${System.currentTimeMillis() / 1000}@$publicIp"
         createSocket()
 
-        Thread({
+        receiveThread = Thread({
             try { receiveLoop() }
             catch (e: Exception) { uiLog("Receive loop crashed: ${e.message}") }
-        }, "SIP-Recv").start()
+        }, "SIP-Recv").also { it.start() }
         Thread({
             try { monitorLoop() }
             catch (e: Exception) { uiLog("Monitor loop crashed: ${e.message}") }
@@ -159,6 +160,15 @@ class SipClient(
         transport?.close()
         transport = null
         resolvedServerAddr = null
+        // On Android 7, closing a raw fd from another thread does not wake a
+        // poll() immediately. Until that poll returns the kernel can retain a
+        // reference to the bound UDP socket, and a replacement bind gets
+        // EADDRINUSE. Wait for the sole receiver before reconnecting.
+        receiveThread?.takeIf { it !== Thread.currentThread() }?.let { receiver ->
+            try { receiver.join(SOCKET_TIMEOUT_MS.toLong() + 1_000L) } catch (_: InterruptedException) { }
+            if (receiver.isAlive) Log.w(TAG, "SIP receive thread did not stop before socket rebind")
+        }
+        receiveThread = null
     }
 
     private fun createSocket() {
@@ -231,7 +241,7 @@ class SipClient(
 
     private fun doSend(data: String, address: Pair<String, Int>) {
         try {
-            val t = transport ?: return
+            val t = transport ?: throw IllegalStateException("SIP transport is not open")
             // Use the cached address for the server so this never does DNS.
             val cached = resolvedServerAddr
             if (t is UdpSipTransport && cached != null && address.first == serverDomain) {
@@ -239,6 +249,9 @@ class SipClient(
             } else {
                 t.send(data, address.first, address.second)
             }
+            val firstLine = data.lineSequence().firstOrNull()?.takeIf { it.isNotBlank() } ?: "<CRLF keepalive>"
+            Log.i(TAG, "TX ${t.viaTransport} ${data.toByteArray(Charsets.UTF_8).size}B " +
+                "$localIp:${t.localPort} -> ${address.first}:${address.second} '$firstLine'")
         } catch (e: Exception) {
             uiLog("Send error to ${address.first}:${address.second} [thread=${Thread.currentThread().name}]: ${e.javaClass.simpleName}: ${e.message}")
         }
@@ -253,6 +266,9 @@ class SipClient(
             try {
                 val t = transport ?: break
                 val (data, address) = t.receive() ?: continue
+                val firstLine = data.lineSequence().firstOrNull()?.takeIf { it.isNotBlank() } ?: "<empty>"
+                Log.i(TAG, "RX ${t.viaTransport} ${data.toByteArray(Charsets.UTF_8).size}B " +
+                    "${address.first}:${address.second} -> $localIp:${t.localPort} '$firstLine'")
                 handlePacket(data, address)
             } catch (_: SocketTimeoutException) {
                 // normal
@@ -273,10 +289,33 @@ class SipClient(
     private fun handlePacket(data: String, address: Pair<String, Int>) {
         val msg = SipMessage.parse(data) ?: return
 
+        if (msg.isResponse && msg.cseq?.contains("INVITE", ignoreCase = true) == true) {
+            Log.i(TAG, "Received SIP INVITE response '${msg.startLine.trim()}' " +
+                "CSeq=${msg.cseq} call-id=${msg.callId} from=${address.first}:${address.second}")
+        }
+
+        if (msg.isResponse && msg.cseq?.contains("REGISTER", ignoreCase = true) == true) {
+            Log.i(TAG, "Received SIP REGISTER response '${msg.startLine.trim()}' " +
+                "CSeq=${msg.cseq} call-id=${msg.callId} from=${address.first}:${address.second}")
+        }
+
         // OPTIONS keepalive from server
         if (msg.isRequest && msg.method == "OPTIONS") {
-            val resp = SipBuilder.optionsResponse(msg, username, publicIp, advertisedPort)
+            Log.i(TAG, "OPTIONS received from ${address.first}:${address.second}; queuing 200 OK " +
+                "for call-id=${msg.callId} cseq=${msg.cseq}")
+            val resp = SipBuilder.optionsResponse(msg, username, publicIp, advertisedPort, address)
             sendTo(resp, address)
+            return
+        }
+
+        // FreePBX sends unsolicited message-summary NOTIFY requests after a
+        // registration. They are not used by this headless gateway, but every
+        // SIP request still needs a final response; otherwise PJSIP retries
+        // them for tens of seconds and needlessly loads the single receiver.
+        if (msg.isRequest && msg.method == "NOTIFY") {
+            Log.i(TAG, "NOTIFY received from ${address.first}:${address.second}; replying 200 OK " +
+                "for call-id=${msg.callId} cseq=${msg.cseq}")
+            sendTo(SipBuilder.statusResponse(msg, 200, "OK", receivedFrom = address), address)
             return
         }
 
@@ -338,7 +377,7 @@ class SipClient(
                 503 -> "Service Unavailable"
                 else -> "Error"
             }
-            sendTo(SipBuilder.statusResponse(msg, code, reason, extra), address)
+            sendTo(SipBuilder.statusResponse(msg, code, reason, extra, receivedFrom = address), address)
             return
         }
 
@@ -371,6 +410,20 @@ class SipClient(
             val ok = SipBuilder.ok200(msg, username, publicIp, advertisedPort)
             sendTo(ok, address)
             return
+        }
+
+
+        if (msg.isRequest) {
+            Log.w(TAG, "Unsupported SIP request '${msg.method}' from ${address.first}:${address.second}; " +
+                "replying 405 Method Not Allowed")
+            sendTo(
+                SipBuilder.statusResponse(
+                    msg, 405, "Method Not Allowed",
+                    listOf("Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, MESSAGE, NOTIFY"),
+                    receivedFrom = address
+                ),
+                address
+            )
         }
     }
 
@@ -445,6 +498,8 @@ class SipClient(
             callIdBase, cseq.getAndIncrement(),
             auth
         )
+        Log.i(TAG, "Queueing REGISTER Contact=<sip:$username@$publicIp:$advertisedPort> " +
+            "transport=${if (useTls) "TLS" else "UDP"} authenticated=${auth != null}")
         sendTo(msg, serverAddress)
     }
 
@@ -547,9 +602,11 @@ class SipClient(
         call.localRtpPort = localRtpPort
         call.outboundCallerIdNumber = callerIdNumber
         call.outboundCallerIdName = callerIdName
-        val fromUser = callerIdNumber ?: username
-        val fromDisplay = if (callerIdName != null) "\"$callerIdName\" " else ""
-        call.fromHeader = "$fromDisplay<sip:$fromUser@$serverDomain>;tag=${call.localTag}"
+        // PJSIP identifies an out-of-dialog request by its From user before
+        // checking Authorization. Keep the authenticated endpoint (204) in
+        // From and carry the GSM caller separately as asserted identity.
+        val fromUser = username
+        call.fromHeader = "<sip:$fromUser@$serverDomain>;tag=${call.localTag}"
         call.toHeader = "<sip:$targetExtension@$serverDomain>"
 
         // Generated once, here, and reused for every retry and re-INVITE of
@@ -577,7 +634,9 @@ class SipClient(
         sendTo(invite, serverAddress)
         // Log both halves the server routes on: the Request-URI it turns into
         // EXTEN, and the From user it turns into caller ID.
-        Log.i(TAG, "Sent INVITE RURI=$targetUri From=<sip:$fromUser@$serverDomain> (call-id=$callId)")
+        Log.i(TAG, "Queued SIP INVITE transport=${if (useTls) "TLS" else "UDP"} " +
+            "peer=${serverAddress.first}:${serverAddress.second} RURI=$targetUri " +
+            "From=<sip:$fromUser@$serverDomain> CSeq=${call.originalInvite?.cseq} call-id=$callId")
 
         // RFC 3261 Timer A: retransmit INVITE over UDP until any response is received.
         // Intervals: 500ms, 1s, 2s, 4s (capped at T2=4s). Stops immediately when
@@ -650,7 +709,7 @@ class SipClient(
             var cseq = 1
             sendTo(
                 SipBuilder.message(
-                    targetUri, fromUser, serverDomain, publicIp, advertisedPort,
+                    targetUri, username, serverDomain, publicIp, advertisedPort,
                     callId, cseq, body, contentType, extraHeaders, fromTag
                 ),
                 serverAddress
@@ -669,7 +728,7 @@ class SipClient(
                 )
                 sendTo(
                     SipBuilder.message(
-                        targetUri, fromUser, serverDomain, publicIp, advertisedPort,
+                        targetUri, username, serverDomain, publicIp, advertisedPort,
                         callId, cseq, body, contentType, extraHeaders, fromTag, auth
                     ),
                     serverAddress

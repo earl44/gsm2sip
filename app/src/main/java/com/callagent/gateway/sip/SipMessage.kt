@@ -316,6 +316,30 @@ object SipBuilder {
     private fun branch(): String = "z9hG4bK${(100000000..999999999).random()}"
     private fun tag(): String = "gw${(100000000..999999999).random()}"
 
+    /** Stable UAS tag for retransmissions of the same server transaction. */
+    private fun transactionTag(msg: SipMessage): String {
+        val key = "${msg.callId}|${msg.cseq}|${msg.fromTag}"
+        return "gw${kotlin.math.abs(key.hashCode().toLong()).toString(16)}"
+    }
+
+    /**
+     * Copy the top Via as required for a response and honour RFC 3581 rport.
+     * PJSIP sends `;rport` in OPTIONS/INVITE. Returning the parameter without
+     * its observed source port makes the response invalid for that transaction.
+     */
+    private fun responseVia(msg: SipMessage, receivedFrom: Pair<String, Int>?): String {
+        var via = msg.via.orEmpty()
+        val source = receivedFrom ?: return via
+        val bareRport = Regex(";rport(?=;|$)", RegexOption.IGNORE_CASE)
+        if (bareRport.containsMatchIn(via)) {
+            via = bareRport.replaceFirst(
+                via,
+                ";received=${source.first};rport=${source.second}"
+            )
+        }
+        return via
+    }
+
     fun register(
         username: String, domain: String, serverPort: Int,
         localIp: String, localPort: Int,
@@ -350,8 +374,7 @@ object SipBuilder {
         auth: String? = null,
         srtp: SrtpKeys? = null
     ): String {
-        val fromDisplay = if (callerIdName != null) "\"$callerIdName\" " else ""
-        val fromUser = callerIdNumber ?: username
+        val callerDisplay = if (callerIdName != null) "\"$callerIdName\" " else ""
         val sdp = buildSdp(localIp, localRtpPort, srtp)
         return buildString {
             append("INVITE $targetUri SIP/2.0\r\n")
@@ -359,7 +382,10 @@ object SipBuilder {
             append("Max-Forwards: 70\r\n")
             append("User-Agent: $userAgent\r\n")
             append("To: <$targetUri>\r\n")
-            append("From: $fromDisplay<sip:$fromUser@$domain>;tag=$fromTag\r\n")
+            append("From: <sip:$username@$domain>;tag=$fromTag\r\n")
+            if (!callerIdNumber.isNullOrBlank()) {
+                append("P-Asserted-Identity: $callerDisplay<sip:$callerIdNumber@$domain>\r\n")
+            }
             append("Call-ID: $callId\r\n")
             append("CSeq: $cseq INVITE\r\n")
             append("Contact: <sip:$username@$localIp:$localPort$contactParam>\r\n")
@@ -415,13 +441,14 @@ object SipBuilder {
         code: Int,
         reason: String,
         extraHeaders: List<String> = emptyList(),
-        toTag: String = tag()
+        toTag: String = transactionTag(msg),
+        receivedFrom: Pair<String, Int>? = null
     ): String {
         val to = msg.to ?: ""
         val toWithTag = if (to.contains(";tag=")) to else "$to;tag=$toTag"
         return buildString {
             append("SIP/2.0 $code $reason\r\n")
-            append("Via: ${msg.via}\r\n")
+            append("Via: ${responseVia(msg, receivedFrom)}\r\n")
             append("To: $toWithTag\r\n")
             append("From: ${msg.from}\r\n")
             append("Call-ID: ${msg.callId}\r\n")
@@ -574,7 +601,13 @@ object SipBuilder {
      * is worse than admitting the gap.  The Allow list is likewise the real
      * set of handled methods, not the conventional long one.
      */
-    fun optionsResponse(msg: SipMessage, username: String, localIp: String, localPort: Int): String {
+    fun optionsResponse(
+        msg: SipMessage,
+        username: String,
+        localIp: String,
+        localPort: Int,
+        receivedFrom: Pair<String, Int>? = null
+    ): String {
         // A capability description, not an offer: no port is reserved and no
         // crypto line appears.  SRTP keys are per-call and generated when the
         // call is set up -- putting one here would publish a key outside any
@@ -602,10 +635,20 @@ object SipBuilder {
             append("a=ptime:20\r\n")
             append("a=sendrecv\r\n")
         }
+        // A final response created by a UAS must add a To tag. Copying the
+        // tag-less OPTIONS To header verbatim makes PJSIP keep retransmitting
+        // the qualify request and eventually mark the endpoint Unavailable,
+        // even though the UDP response reached the PBX.
+        val requestTo = msg.to.orEmpty()
+        val responseTo = if (requestTo.contains(";tag=", ignoreCase = true)) {
+            requestTo
+        } else {
+            "$requestTo;tag=${transactionTag(msg)}"
+        }
         return buildString {
             append("SIP/2.0 200 OK\r\n")
-            append("Via: ${msg.via}\r\n")
-            append("To: ${msg.to}\r\n")
+            append("Via: ${responseVia(msg, receivedFrom)}\r\n")
+            append("To: $responseTo\r\n")
             append("From: ${msg.from}\r\n")
             append("Call-ID: ${msg.callId}\r\n")
             append("CSeq: ${msg.cseq}\r\n")
@@ -613,7 +656,7 @@ object SipBuilder {
             append("User-Agent: $userAgent\r\n")
             // The real set: CANCEL and MESSAGE included because inbound ones
             // are handled; nothing here is aspirational.
-            append("Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, MESSAGE\r\n")
+            append("Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, MESSAGE, NOTIFY\r\n")
             // text/plain because inbound MESSAGE carries SMS bodies.
             append("Accept: application/sdp, text/plain\r\n")
             append("Accept-Encoding: identity\r\n")

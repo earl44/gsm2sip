@@ -40,11 +40,23 @@ object SipAuth {
         uri: String,
         username: String,
         password: String,
-        params: AuthParams
+        params: AuthParams,
+        cnonceOverride: String? = null,
+        nonceCount: Int = 1
     ): String {
         val ha1 = md5("$username:${params.realm}:$password")
         val ha2 = md5("$method:$uri")
-        val response = md5("$ha1:${params.nonce}:$ha2")
+        val qop = params.qop
+            ?.split(',')
+            ?.map { it.trim().trim('"').lowercase() }
+            ?.firstOrNull { it == "auth" }
+        val nc = "%08x".format(nonceCount)
+        val cnonce = cnonceOverride ?: java.util.UUID.randomUUID().toString().replace("-", "")
+        val response = if (qop != null) {
+            md5("$ha1:${params.nonce}:$nc:$cnonce:$qop:$ha2")
+        } else {
+            md5("$ha1:${params.nonce}:$ha2")
+        }
 
         return buildString {
             append("Authorization: Digest username=\"$username\", ")
@@ -54,6 +66,11 @@ object SipAuth {
             append("response=\"$response\", ")
             append("algorithm=MD5")
             if (params.opaque != null) append(", opaque=\"${params.opaque}\"")
+            if (qop != null) {
+                append(", qop=$qop")
+                append(", nc=$nc")
+                append(", cnonce=\"$cnonce\"")
+            }
             append("\r\n")
         }
     }

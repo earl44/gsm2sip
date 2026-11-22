@@ -497,7 +497,11 @@ class MainActivity : AppCompatActivity() {
             // The IMEI belongs to the radio, so it names the slot; the ICCID
             // names the card in it.  Either tells two otherwise identical
             // rows apart, so show whichever the platform will hand over.
-            val ident = runCatching { tm?.getImei(slot) }.getOrNull()
+            @Suppress("DEPRECATION")
+            val ident = runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) tm?.getImei(slot)
+                else tm?.getDeviceId(slot)
+            }.getOrNull()
                 ?.takeIf { it.isNotBlank() }?.let { "IMEI $it" }
                 ?: info.iccId?.takeIf { it.isNotBlank() }
                     ?.let { "ICCID \u2026${it.takeLast(6)}" }
@@ -561,6 +565,8 @@ class MainActivity : AppCompatActivity() {
         findViewById<EditText>(R.id.etCfgUser).setText(prefs.getString("user", ""))
         findViewById<EditText>(R.id.etCfgPass).setText(prefs.getString("pass", ""))
         buildOwnNumberFields(prefs)
+        findViewById<EditText>(R.id.etCfgInboundTarget)
+            .setText(prefs.getString("inbound_sip_target", ""))
         findViewById<CheckBox>(R.id.cbCfgAutoconnect).isChecked =
             prefs.getBoolean("autoconnect", true)
         findViewById<CheckBox>(R.id.cbCfgUseStun).isChecked =
@@ -669,6 +675,7 @@ class MainActivity : AppCompatActivity() {
         val port = findViewById<EditText>(R.id.etCfgPort).text.toString().trim().toIntOrNull() ?: 5060
         val user = findViewById<EditText>(R.id.etCfgUser).text.toString().trim()
         val pass = findViewById<EditText>(R.id.etCfgPass).text.toString().trim()
+        val inboundTarget = findViewById<EditText>(R.id.etCfgInboundTarget).text.toString().trim()
         // The lowest active SIM's number is the one everything that does not
         // know which SIM it is dealing with will use.
         val own = ownNumberFields.firstOrNull()?.second?.text?.toString()?.trim().orEmpty()
@@ -696,6 +703,7 @@ class MainActivity : AppCompatActivity() {
             .putInt("port", port)
             .putString("user", user)
             .putString("pass", pass)
+            .putString("inbound_sip_target", inboundTarget)
             .putString("own_number", own)
             .also { ed ->
                 ownNumberFields.forEach { (slot, et) ->
@@ -712,7 +720,8 @@ class MainActivity : AppCompatActivity() {
             .putInt("agent_vol_step", agentVolStep)
             .apply()
         appendLog(
-            "Config saved: $user@$server:$port (own=${own.ifEmpty { "auto" }}, " +
+            "Config saved: $user@$server:$port (target=${inboundTarget.ifEmpty { "SIM number" }}, " +
+                "own=${own.ifEmpty { "auto" }}, " +
                 "codec=$codec, stun=${if (useStun) "on" else "off"}, " +
                 "tls=${if (tls) "on" else "off"}, " +
                 "srtp=${if (srtp && tls) "on" else "off"}, " +
@@ -884,7 +893,8 @@ class MainActivity : AppCompatActivity() {
                 android.telephony.TelephonyManager.NETWORK_TYPE_UNKNOWN -> "—"
                 else -> "?"
             }
-            val dbm = signalDbm(tm.signalStrength)
+            val dbm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
+                signalDbm(tm.signalStrength) else null
             if (dbm != null && dbm != Int.MAX_VALUE) "$type $name ${dbm}dBm"
             else "$type $name"
         } catch (e: Exception) {
@@ -1103,7 +1113,9 @@ class MainActivity : AppCompatActivity() {
                     )
                 }
             } else {
-                signalDbm(tm.signalStrength)?.let { appendLine("Signal       : $it dBm") }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    signalDbm(tm.signalStrength)?.let { appendLine("Signal       : $it dBm") }
+                }
             }
         } catch (e: Exception) {
             appendLine("telephony: ${e.message}")
@@ -1198,9 +1210,13 @@ class MainActivity : AppCompatActivity() {
                 row("PCI", num(id.pci))
                 row("TAC", num(id.tac))
                 row("EARFCN", num(id.earfcn))
-                row("MCC/MNC", "${id.mccString ?: "—"}/${id.mncString ?: "—"}")
-                id.operatorAlphaLong?.toString()?.takeIf { it.isNotBlank() }
-                    ?.let { row("Carrier", it) }
+                @Suppress("DEPRECATION")
+                row("MCC/MNC", if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
+                    "${id.mccString ?: "—"}/${id.mncString ?: "—"}" else "${num(id.mcc)}/${num(id.mnc)}")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    id.operatorAlphaLong?.toString()?.takeIf { it.isNotBlank() }
+                        ?.let { row("Carrier", it) }
+                }
                 row("Signal", sig(info.cellSignalStrength))
             }
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
@@ -1221,7 +1237,9 @@ class MainActivity : AppCompatActivity() {
                 row("LAC", num(id.lac))
                 row("PSC", num(id.psc))
                 row("UARFCN", num(id.uarfcn))
-                row("MCC/MNC", "${id.mccString ?: "—"}/${id.mncString ?: "—"}")
+                @Suppress("DEPRECATION")
+                row("MCC/MNC", if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
+                    "${id.mccString ?: "—"}/${id.mncString ?: "—"}" else "${num(id.mcc)}/${num(id.mnc)}")
                 row("Signal", sig(info.cellSignalStrength))
             }
             info is android.telephony.CellInfoGsm -> {
@@ -1231,7 +1249,9 @@ class MainActivity : AppCompatActivity() {
                 row("LAC", num(id.lac))
                 row("ARFCN", num(id.arfcn))
                 row("BSIC", num(id.bsic))
-                row("MCC/MNC", "${id.mccString ?: "—"}/${id.mncString ?: "—"}")
+                @Suppress("DEPRECATION")
+                row("MCC/MNC", if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
+                    "${id.mccString ?: "—"}/${id.mncString ?: "—"}" else "${num(id.mcc)}/${num(id.mnc)}")
                 row("Signal", sig(info.cellSignalStrength))
             }
             else -> {
@@ -1413,7 +1433,12 @@ class MainActivity : AppCompatActivity() {
         // NOT_EXPORTED: the service sends these with setPackage(), so nothing
         // outside the app has any business delivering them — exported, any
         // installed app could feed the UI fabricated status and log lines.
-        registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(statusReceiver, filter)
+        }
 
         // Replay any log messages buffered while activity was paused
         // Re-render from the service's buffer rather than consuming it: the
@@ -1545,9 +1570,10 @@ class MainActivity : AppCompatActivity() {
                 this, Manifest.permission.READ_PHONE_STATE
             ) == PackageManager.PERMISSION_GRANTED
 
-            val hasAnswerCalls = ContextCompat.checkSelfPermission(
-                this, Manifest.permission.ANSWER_PHONE_CALLS
-            ) == PackageManager.PERMISSION_GRANTED
+            val hasAnswerCalls = Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+                ContextCompat.checkSelfPermission(
+                    this, Manifest.permission.ANSWER_PHONE_CALLS
+                ) == PackageManager.PERMISSION_GRANTED
 
             val hasCallPhone = ContextCompat.checkSelfPermission(
                 this, Manifest.permission.CALL_PHONE
@@ -1952,7 +1978,6 @@ class MainActivity : AppCompatActivity() {
             Manifest.permission.RECORD_AUDIO,
             Manifest.permission.READ_PHONE_STATE,
             Manifest.permission.CALL_PHONE,
-            Manifest.permission.ANSWER_PHONE_CALLS,
             Manifest.permission.READ_CALL_LOG
             // Deliberately not location.  A gateway has no business asking for
             // it, and the two things that use it are cosmetic: the cell-id
@@ -1960,6 +1985,9 @@ class MainActivity : AppCompatActivity() {
             // returned "<unknown ssid>" without location since Android 8.1).
             // Both degrade to a placeholder instead.
         )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            perms.add(Manifest.permission.ANSWER_PHONE_CALLS)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             perms.add(Manifest.permission.READ_PHONE_NUMBERS)
         }

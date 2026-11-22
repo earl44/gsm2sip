@@ -177,7 +177,7 @@ class CallOrchestrator(
                 handleInboundFlow(call)
             } catch (t: Throwable) {
                 Log.e(TAG, "Inbound flow failed: $t", t)
-                tearDown("inbound flow failed: ${t.javaClass.simpleName}")
+                keepGsmRingingAfterSipFailure("Inbound SIP flow failed: ${t.javaClass.simpleName}")
             }
         }, "SIP-OutCall").start()
             return
@@ -302,6 +302,11 @@ class CallOrchestrator(
      */
     private fun inboundSipDestination(gsmCall: Call? = null): String {
         val prefs = context.getSharedPreferences("gateway", Context.MODE_PRIVATE)
+        val configuredTarget = prefs.getString("inbound_sip_target", "")?.trim().orEmpty()
+        if (configuredTarget.isNotEmpty()) {
+            Log.i(TAG, "Inbound SIP target from settings: $configuredTarget")
+            return configuredTarget
+        }
         val subscription = gsmCall?.details?.accountHandle?.let { account ->
             try {
                 val subId = com.callagent.gateway.gsm.GsmCallManager.subscriptionIdOf(context, account)
@@ -562,10 +567,9 @@ class CallOrchestrator(
         Log.i(TAG, "SIP call terminated: ${call.callId} (bridge=$bridgeState, retries=$sipCallRetries)")
         if (call != activeSipCall) return
 
-        // If GSM is still ringing and we haven't exhausted retries, try again —
-        // but only after a transient failure.  A deliberate answer from the far
-        // side (busy, declined, unavailable) must end the GSM call: retrying it
-        // re-rang the softphone after the user had rejected the call.
+        // If GSM is still ringing and we haven't exhausted retries, try again
+        // after a transient failure. A final SIP failure must not reject the
+        // cellular caller: the two legs are independent until SIP answers.
         val status = call.finalStatus
         val transient = status == 0 || status == 408 || status == 500 || status == 503 || status == 504
         if ((bridgeState == BridgeState.SIP_CALLING || bridgeState == BridgeState.SIP_RINGING)
@@ -585,8 +589,48 @@ class CallOrchestrator(
             return
         }
 
-        if (status >= 300) Log.i(TAG, "SIP side answered $status — not retrying, ending the GSM call")
+        if ((bridgeState == BridgeState.SIP_CALLING || bridgeState == BridgeState.SIP_RINGING) &&
+            isGsmStillRinging()) {
+            keepGsmRingingAfterSipFailure(
+                if (status > 0) "SIP INVITE failed with $status" else "SIP INVITE failed without a response",
+                call
+            )
+            return
+        }
         tearDown("SIP call ended")
+    }
+
+    private fun isGsmStillRinging(): Boolean {
+        val call = activeGsmCall ?: return false
+        return try { call.state == Call.STATE_RINGING } catch (_: Exception) { false }
+    }
+
+    /** End only the failed SIP attempt and leave the incoming GSM call alone. */
+    @Synchronized
+    private fun keepGsmRingingAfterSipFailure(reason: String, failedCall: SipCall? = activeSipCall) {
+        if (!isGsmStillRinging()) {
+            tearDown(reason)
+            return
+        }
+        if (failedCall != null && activeSipCall !== failedCall) return
+
+        activeSipCall = null
+        pendingRtpAddr = null
+        pendingRtpPort = 0
+        pendingLocalRtpPort = 0
+        bridgeState = BridgeState.GSM_RINGING
+
+        failedCall?.let {
+            try {
+                if (it.state != SipCall.State.TERMINATED) it.hangup()
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not terminate failed SIP attempt: ${e.message}")
+            }
+            sipClient.removeCall(it.callId)
+        }
+
+        Log.w(TAG, "$reason — GSM call remains ringing; no disconnect requested")
+        listener?.onStateChanged(bridgeState, "$reason; GSM still ringing")
     }
 
     // ── GsmCallManager.Listener ─────────────────────────
@@ -639,7 +683,7 @@ class CallOrchestrator(
                 handleInboundFlow(call)
             } catch (t: Throwable) {
                 Log.e(TAG, "Inbound flow failed: $t", t)
-                tearDown("inbound flow failed: ${t.javaClass.simpleName}")
+                keepGsmRingingAfterSipFailure("Inbound SIP flow failed: ${t.javaClass.simpleName}")
             }
         }, "SIP-OutCall").start()
     }
@@ -652,6 +696,16 @@ class CallOrchestrator(
 
         when (bridgeState) {
             BridgeState.SIP_CALLING, BridgeState.SIP_RINGING -> {
+                // Broadcom Hawaii cannot open its 48 kHz HQ capture device
+                // after telephony becomes active.  For an inbound call we
+                // therefore pre-start RTP/capture while GSM is still ringing;
+                // onGsmCallActive only has to publish the bridged state.
+                if (activeRtpSession != null) {
+                    bridgeState = BridgeState.BRIDGED
+                    listener?.onStateChanged(bridgeState, "Bridged (inbound)")
+                    Log.i(TAG, "Inbound bridge established — pre-opened digital GSM downlink active")
+                    return
+                }
                 // INBOUND flow: GSM answered (triggered from onRtpReady).
                 // SIP agent is ready — start RTP immediately so caller
                 // hears the agent from the first moment.
@@ -698,7 +752,7 @@ class CallOrchestrator(
                 handleInboundFlow(call)
             } catch (t: Throwable) {
                 Log.e(TAG, "Inbound flow failed: $t", t)
-                tearDown("inbound flow failed: ${t.javaClass.simpleName}")
+                keepGsmRingingAfterSipFailure("Inbound SIP flow failed: ${t.javaClass.simpleName}")
             }
         }, "SIP-OutCall").start()
                 } else {
@@ -852,17 +906,29 @@ class CallOrchestrator(
                     Log.i(TAG, "Dialler bridge established (codec=$codecName)")
                 }, "RTP-Start").start()
             } else {
-                // INBOUND flow: SIP/agent answered — save RTP info and answer GSM.
-                // When GSM goes active (onGsmCallActive), RTP starts immediately
-                // so the caller hears the agent from the first moment.
-                pendingRtpAddr = remoteRtpAddr
-                pendingRtpPort = remoteRtpPort
-                pendingPayloadType = payloadType
-                pendingLocalRtpPort = call.localRtpPort
-
-                Log.i(TAG, "SIP answered (codec=$codecName) — answering GSM call now")
-                activeGsmCall?.let { GsmCallManager.answerCall(it) }
-                    ?: Log.e(TAG, "SIP answered but no active GSM call to answer!")
+                // INBOUND flow: open RTP and the Broadcom 48 kHz digital
+                // downlink while GSM is still ringing.  The kernel explicitly
+                // rejects opening this HQ capture path once telephony is
+                // active ("48KHz in call").  Its read blocks harmlessly until
+                // the call is answered and the earpiece source begins flowing.
+                val localRtpPort = call.localRtpPort
+                Thread({
+                    startRtp(localRtpPort, remoteRtpAddr, remoteRtpPort, payloadType)
+                    if (bridgeState == BridgeState.IDLE || bridgeState == BridgeState.TEARING_DOWN) {
+                        Log.w(TAG, "Bridge torn down during pre-call RTP setup — not answering GSM")
+                        return@Thread
+                    }
+                    // Give tinycap's child a short deterministic window to
+                    // complete ALSA prepare/trigger before telephony flips the
+                    // driver's in-call flag.
+                    try { Thread.sleep(400) } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return@Thread
+                    }
+                    Log.i(TAG, "SIP answered (codec=$codecName) — digital downlink pre-opened; answering GSM")
+                    activeGsmCall?.let { GsmCallManager.answerCall(it) }
+                        ?: Log.e(TAG, "SIP answered but no active GSM call to answer!")
+                }, "RTP-Preopen").start()
             }
         } else if (bridgeState == BridgeState.GSM_ANSWERED) {
             // Edge case: GSM was already answered (e.g. user picked up manually)
@@ -889,8 +955,9 @@ class CallOrchestrator(
         listener?.onStateChanged(bridgeState, "Calling Asterisk for $callerNumber")
 
         val rtpPort = allocateRtpPort()
+        val sipTarget = inboundSipDestination(gsmCall)
         val sipCall = sipClient.makeCall(
-            targetExtension = inboundSipDestination(gsmCall),
+            targetExtension = sipTarget,
             localRtpPort = rtpPort,
             callerIdNumber = callerNumber,
             callerIdName = callerName
@@ -898,7 +965,8 @@ class CallOrchestrator(
         sipCall.listener = this
         activeSipCall = sipCall
 
-        Log.i(TAG, "SIP INVITE sent to Asterisk (caller=$callerNumber, rtp=$rtpPort)")
+        Log.i(TAG, "SIP INVITE started (target=$sipTarget, caller=$callerNumber, " +
+            "rtp=$rtpPort, call-id=${sipCall.callId})")
 
         // Timeout: if the server has not even said "ringing" within 30 s, give
         // up.  Once it rings (180), the server's own dial timeout decides; ours
@@ -916,7 +984,10 @@ class CallOrchestrator(
                 return
             }
             Log.w(TAG, "SIP call timeout — ${if (ringing) "rang ${elapsed / 1000}s" else "no ringing from the server in ${elapsed / 1000}s"}")
-            tearDown(if (ringing) "No answer" else "Asterisk not answering")
+            keepGsmRingingAfterSipFailure(
+                if (ringing) "SIP target did not answer" else "SIP server did not answer INVITE",
+                sipCall
+            )
         }
         schedule(SIP_CALL_TIMEOUT_MS) { check() }
     }
@@ -1109,11 +1180,15 @@ class CallOrchestrator(
             val gsmCallToDisconnect = activeGsmCall ?: GsmCallManager.activeCall
             gsmCallToDisconnect?.let { call ->
                 try {
-                    // Always disconnect — not just when ACTIVE.  If the SIP
-                    // call fails before GSM is answered, the ringing GSM call
-                    // was left dangling (S4 Mini: "second call never answered").
-                    // Call.disconnect() works for RINGING, DIALING, and ACTIVE.
-                    call.disconnect()
+                    val gsmState = call.state
+                    if (gsmState != Call.STATE_DISCONNECTED && gsmState != Call.STATE_DISCONNECTING) {
+                        Log.i(TAG, "Requesting GSM disconnect during teardown " +
+                            "(state=$gsmState, reason=$reason)")
+                        GsmCallManager.hangupCall(call, "bridge teardown: $reason")
+                    } else {
+                        Log.i(TAG, "GSM already ended during teardown (state=$gsmState); " +
+                            "no disconnect requested")
+                    }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error disconnecting GSM: ${e.message}")
                 }

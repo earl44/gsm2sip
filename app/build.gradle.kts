@@ -9,10 +9,11 @@ android {
 
     defaultConfig {
         applicationId = "com.callagent.gateway"
-        minSdk = 26
+        // Galaxy S Duos 2 / Broadcom Hawaii test target runs Android 7.1.2.
+        minSdk = 25
         targetSdk = 34
-        versionCode = 457
-        versionName = "1.4.18"
+        versionCode = 466
+        versionName = "1.4.27"
     }
 
     // A release build is signed with the same debug key the debug build uses.

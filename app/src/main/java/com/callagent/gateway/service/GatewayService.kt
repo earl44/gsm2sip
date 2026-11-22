@@ -735,7 +735,8 @@ class GatewayService : Service() {
 
         val intent = Intent(this, GatewayService::class.java).apply { action = ACTION_SMS_SEND }
         try {
-            startForegroundService(intent)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
+            else startService(intent)
         } catch (e: Exception) {
             Log.w(TAG, "Could not schedule SMS dispatch: ${e.message}")
         }
@@ -1244,6 +1245,7 @@ class GatewayService : Service() {
         sipClient = sip
 
         val orch = CallOrchestrator(this, sip)
+        broadcastLog("Audio profile: ${GsmCallManager.profile.name}")
         orch.listener = object : CallOrchestrator.OrchestratorListener {
             override fun onStateChanged(state: CallOrchestrator.BridgeState, info: String) {
                 Log.i(TAG, "Bridge: $state - $info")
@@ -1369,6 +1371,13 @@ class GatewayService : Service() {
             Log.e(TAG, "Failed to start SIP client: ${e.message}", e)
             broadcastLog("ERROR: SIP start failed — ${e.message}")
             broadcastStatus("ERROR", "SIP start failed: ${e.message}")
+            // Never publish a client whose socket failed to open. makeCall()
+            // would otherwise report an INVITE as sent even though transport
+            // and sendExecutor are null, while the old fd can still own 5062.
+            orch.stop()
+            sip.stop()
+            if (orchestrator === orch) orchestrator = null
+            if (sipClient === sip) sipClient = null
         }
     }
 
@@ -1411,6 +1420,7 @@ class GatewayService : Service() {
      * devices that ran an earlier build.
      */
     private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel(
@@ -1523,7 +1533,12 @@ class GatewayService : Service() {
         // reached from the app itself.  ACTION_MONITOR still exists and is
         // still handled, so anything already bound to it keeps working.
 
-        return Notification.Builder(this, activeChannelId())
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            Notification.Builder(this, activeChannelId()) else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+        return builder
             .setContentTitle(statusText)
             .setSmallIcon(icon)
             .setColor(accent)
@@ -1828,7 +1843,8 @@ class GatewayService : Service() {
                 putExtra(EXTRA_SMS_ID, id)
             }
             try {
-                context.startForegroundService(intent)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
+                else context.startService(intent)
             } catch (e: Exception) {
                 Log.w(TAG, "Could not wake gateway for SMS report: ${e.message}")
             }
@@ -1839,7 +1855,8 @@ class GatewayService : Service() {
                 action = ACTION_SMS_FLUSH
             }
             try {
-                context.startForegroundService(intent)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
+                else context.startService(intent)
             } catch (e: Exception) {
                 Log.w(TAG, "Could not wake gateway for SMS: ${e.message}")
             }
@@ -1853,7 +1870,8 @@ class GatewayService : Service() {
                 putExtra(EXTRA_USER, user)
                 putExtra(EXTRA_PASS, pass)
             }
-            context.startForegroundService(intent)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
+            else context.startService(intent)
         }
 
         fun stop(context: Context) {
